@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # the render node the encoder binds to
 DEFAULT_DEVICE = "/dev/dri/renderD128"
 
+# encoder and device resolved per detected backend
+BACKENDS = {
+    "nvenc": {"h264": "h264_nvenc", "hevc": "hevc_nvenc", "device": None},
+    "vaapi": {"h264": "h264_vaapi", "hevc": "hevc_vaapi", "device": "/dev/dri/renderD128"},
+}
+
 # what we consider media worth looking at
 MEDIA_EXTENSIONS = (".mp4", ".mkv", ".ts", ".avi", ".mov", ".m4v", ".mpg", ".mpeg", ".wmv")
 
@@ -56,6 +62,67 @@ def cleanup(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def detect_backend() -> Optional[str]:
+    """
+    Work out which hardware encoder this machine can actually use
+
+    The encoder list is not enough on its own — VAAPI encoders are compiled
+    in on boxes with no VAAPI driver behind them, so the render node and the
+    NVIDIA device are checked directly.
+
+    @return Optional[str]: Backend name, or None when there is no hardware path
+    """
+
+    try:
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, timeout=30)
+        encoders = result.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    # nvidia first, a dedicated card beats an igpu every time
+    if "hevc_nvenc" in encoders and os.path.exists("/dev/nvidiactl"):
+        return "nvenc"
+
+    if "hevc_vaapi" in encoders and os.path.exists(BACKENDS["vaapi"]["device"]):
+        try:
+            probe_va = subprocess.run(["vainfo"], capture_output=True, text=True, timeout=30)
+            if "VAEntrypointEncSlice" in probe_va.stdout:
+                return "vaapi"
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return None
+
+
+def is_hdr(stream: Dict[str, Any]) -> bool:
+    """
+    Decide whether a video stream carries a high dynamic range transfer
+
+    @param stream: Dict[str, Any] Video stream from a probe result
+    @return bool: True when the stream needs tonemapping
+    """
+
+    transfer = str(stream.get("color_transfer") or "").lower()
+    return transfer in ("smpte2084", "arib-std-b67")
+
+
+def has_libplacebo() -> bool:
+    """
+    Check whether the Vulkan tonemapping filter is available
+
+    @return bool: True when libplacebo can be used
+    """
+
+    try:
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                                capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+    return "libplacebo" in result.stdout and os.path.isdir("/usr/share/vulkan/icd.d")
 
 
 def probe(path: str) -> Optional[Dict[str, Any]]:
@@ -162,6 +229,10 @@ def should_skip(path: str, args: argparse.Namespace) -> Optional[str]:
     if not args.force and codec in ("hevc", "h265", "av1"):
         return f"already {codec}"
 
+    # tonemapping needs a filter chain the hardware decode path cannot carry
+    if is_hdr(stream) and args.hw_decode:
+        return "hdr with --hw-decode"
+
     # tiny bitrates have nothing left to give
     try:
         bitrate = int((info.get("format") or {}).get("bit_rate") or 0)
@@ -173,43 +244,86 @@ def should_skip(path: str, args: argparse.Namespace) -> Optional[str]:
 
     return None
 
-
-def build_command(path: str, temp: str, args: argparse.Namespace) -> List[str]:
+def tonemap_chain(args: argparse.Namespace) -> List[str]:
     """
-    Assemble the VAAPI ffmpeg command line
+    Build the HDR to SDR filter steps
+
+    libplacebo runs the conversion on the GPU over Vulkan; the zscale chain is
+    the software fallback for boxes without a Vulkan ICD.
+
+    @param args: argparse.Namespace Parsed command line arguments
+    @return List[str]: Filter steps to insert ahead of the encoder
+    """
+
+    if args.libplacebo:
+        return ["libplacebo=colorspace=bt709:color_primaries=bt709:color_trc=bt709:format=yuv420p"]
+
+    return [
+        "zscale=t=linear:npl=100",
+        "format=gbrpf32le",
+        "zscale=p=bt709",
+        f"tonemap=tonemap={args.tonemap}:desat=0",
+        "zscale=t=bt709:m=bt709:r=tv",
+        "format=yuv420p",
+    ]
+
+
+def build_command(path: str, temp: str, args: argparse.Namespace, hdr: bool) -> List[str]:
+    """
+    Assemble the ffmpeg command line for the detected backend
 
     Decoding stays in software by default, which handles far more input formats
-    than the full hardware path; only the encode is offloaded. The scale_vaapi
-    filter is only inserted when a height cap is actually requested.
+    than the full hardware path; only the encode is offloaded. HDR sources pick
+    up a tonemapping chain, which rules out hardware decode since the filters
+    need frames in system memory.
 
     @param path: str Source media path
     @param temp: str Destination temp path
     @param args: argparse.Namespace Parsed command line arguments
+    @param hdr: bool Whether the source needs tonemapping
     @return List[str]: Argument vector for subprocess
     """
 
     cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error"]
 
+    # libplacebo needs a vulkan device initialised up front
+    if hdr and args.libplacebo:
+        cmd += ["-init_hw_device", "vulkan"]
+
+    chain = []
+
     # full hardware path, decode included
-    if args.hw_decode:
-        cmd += [
-            "-hwaccel", "vaapi",
-            "-hwaccel_device", args.device,
-            "-hwaccel_output_format", "vaapi",
-            "-i", path,
-        ]
-        chain = []
-        if args.max_height:
-            chain.append(f"scale_vaapi=w=-2:h={args.max_height}")
+    if args.hw_decode and not hdr:
+        if args.backend == "nvenc":
+            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", path]
+            if args.max_height:
+                chain.append(f"scale_cuda=w=-2:h={args.max_height}")
+        else:
+            cmd += [
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", args.device,
+                "-hwaccel_output_format", "vaapi",
+                "-i", path,
+            ]
+            if args.max_height:
+                chain.append(f"scale_vaapi=w=-2:h={args.max_height}")
 
     # software decode, hardware encode — the compatible default
     else:
-        cmd += ["-vaapi_device", args.device, "-i", path]
-        chain = []
+        if args.backend == "vaapi":
+            cmd += ["-vaapi_device", args.device]
+        cmd += ["-i", path]
+
         if args.max_height:
             chain.append(f"scale=-2:'min({args.max_height},ih)'")
-        chain.append("format=nv12")
-        chain.append("hwupload")
+
+        if hdr:
+            chain += tonemap_chain(args)
+
+        # vaapi wants frames on the card, nvenc takes them from system memory
+        if args.backend == "vaapi":
+            chain.append("format=nv12")
+            chain.append("hwupload")
 
     if chain:
         cmd += ["-vf", ",".join(chain)]
@@ -218,11 +332,16 @@ def build_command(path: str, temp: str, args: argparse.Namespace) -> List[str]:
     cmd += [
         "-map", "0",
         "-c:v", args.vcodec,
-        "-qp", str(args.qp),
         "-c:a", args.acodec,
         "-c:s", "copy",
         "-map_metadata", "0",
     ]
+
+    # the two encoders spell constant quality differently
+    if args.backend == "nvenc":
+        cmd += ["-rc", "constqp", "-qp", str(args.qp)]
+    else:
+        cmd += ["-qp", str(args.qp)]
 
     # mp4 cannot carry the subtitle formats mkv can, so drop them there
     if temp.lower().endswith(".mp4"):
@@ -230,7 +349,6 @@ def build_command(path: str, temp: str, args: argparse.Namespace) -> List[str]:
 
     cmd.append(temp)
     return cmd
-
 
 def transcode(path: str, args: argparse.Namespace) -> Tuple[bool, int, int]:
     """
@@ -250,7 +368,14 @@ def transcode(path: str, args: argparse.Namespace) -> Tuple[bool, int, int]:
     container = args.container or ext.lstrip(".")
     temp = f"{stem}.transcode.{container}"
 
-    cmd = build_command(path, temp, args)
+    info = probe(path)
+    stream = video_stream(info) if info else None
+    hdr = bool(stream and is_hdr(stream))
+
+    if hdr:
+        logger.info("tonemapping hdr source: %s", os.path.basename(path))
+
+    cmd = build_command(path, temp, args, hdr)
     logger.debug("running: %s", " ".join(cmd))
 
     if args.dry_run:
@@ -311,10 +436,27 @@ def run(args: argparse.Namespace) -> int:
     @return int: Process exit code
     """
 
-    # make sure the render node is actually there before we start
-    if not os.path.exists(args.device):
+    # work out the hardware path before anything else
+    if args.backend == "auto":
+        detected = detect_backend()
+        if not detected:
+            logger.error("no usable hardware encoder found")
+            return 1
+        args.backend = detected
+
+    logger.info("using %s backend", args.backend)
+
+    if args.device == "auto":
+        args.device = BACKENDS[args.backend]["device"]
+
+    if args.device and not os.path.exists(args.device):
         logger.error("render device not found: %s", args.device)
         return 1
+
+    if args.vcodec == "auto":
+        args.vcodec = BACKENDS[args.backend]["hevc"]
+
+    args.libplacebo = has_libplacebo()
 
     if not os.path.exists(args.path):
         logger.error("path not found: %s", args.path)
@@ -368,8 +510,10 @@ def main() -> int:
         description="Re-encode a downloaded series tree in place using VAAPI hardware encoding."
     )
     parser.add_argument("path", help="directory tree or single file to process")
-    parser.add_argument("--device", default=DEFAULT_DEVICE, help=f"render node (default: {DEFAULT_DEVICE})")
-    parser.add_argument("--vcodec", default="hevc_vaapi", help="VAAPI encoder (default: hevc_vaapi)")
+    parser.add_argument("--device", default="auto", help="render node (default: auto)")
+    parser.add_argument("--vcodec", default="auto", help="hardware encoder (default: auto)")
+    parser.add_argument("--backend", default="auto", help="hardware backend (default: auto)")
+    parser.add_argument("--tonemap", default="hable", help="software tonemap operator (default: hable)")
     parser.add_argument("--acodec", default="copy", help="audio handling (default: copy)")
     parser.add_argument("--qp", type=int, default=26, help="quality, lower is bigger (default: 26)")
     parser.add_argument("--max-height", type=int, help="cap output height, preserving aspect")
