@@ -17,7 +17,19 @@ if [[ "$ACTION" == "refresh" || "$ACTION" == "all" ]]; then
   TASK_ID=$(curl -s "${EMBY_HOST}/emby/ScheduledTasks?api_key=${API_KEY}" \
     | python3 -c "import sys,json; tasks=[t for t in json.load(sys.stdin) if 'guide' in t['Name'].lower()]; print(tasks[0]['Id']) if tasks else None")
   curl -s -X POST "${EMBY_HOST}/emby/ScheduledTasks/Running/${TASK_ID}?api_key=${API_KEY}" > /dev/null
-  echo "Guide refresh triggered."
+  
+  echo "Guide refresh triggered. Waiting for completion..."
+  sleep 3
+  while true; do
+    STATE=$(curl -s "${EMBY_HOST}/emby/ScheduledTasks/${TASK_ID}?api_key=${API_KEY}" \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print('%s|%s' % (d.get('State',''), d.get('CurrentProgressPercentage') or 0))")
+    if [[ "${STATE%%|*}" == "Idle" ]]; then
+      break
+    fi
+    echo "  Guide refresh: ${STATE%%|*} ${STATE##*|}%"
+    sleep 5
+  done
+  echo "Guide refresh complete."
 fi
 
 if [[ "$ACTION" == "logos" || "$ACTION" == "all" ]]; then
