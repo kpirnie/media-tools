@@ -32,7 +32,8 @@ if [[ "$ACTION" == "refresh" || "$ACTION" == "all" ]]; then
   echo "Guide refresh complete."
 fi
 
-if [[ "$ACTION" == "logos" || "$ACTION" == "all" ]]; then
+#if [[ "$ACTION" == "logos" || "$ACTION" == "all" ]]; then
+if [[ "$ACTION" == "logos" ]]; then
   echo "Fetching item IDs for logo clearing..."
   ITEM_IDS=$(curl -s "${EMBY_HOST}/emby/Items?Recursive=true&api_key=${API_KEY}" \
     | python3 -c "import sys,json; [print(i['Id']) for i in json.load(sys.stdin)['Items']]")
