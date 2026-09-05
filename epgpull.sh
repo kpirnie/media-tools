@@ -10,6 +10,8 @@ extra_epgs=(
 	"https://argon.kptv.im/xmltv.php?username=gmarie&password=176324745544"
 	"https://v12.kptv.im/xmltv.php?username=G8NAFVO9&password=96421197"
 	"https://crx.watch/xmltv.php?username=kpirnietc&password=721499408818"
+	"http://demon-cable.xyz/xmltv.php?username=D2KPIRNIE&password=52529246"
+	"https://demon.ghostcable-epg.fyi"
 )
 
 # input dir for the sync

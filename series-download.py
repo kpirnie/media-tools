@@ -1173,6 +1173,11 @@ def run(args: argparse.Namespace) -> int:
         # then every episode within it, in order
         for ep in sorted(season_eps, key=lambda e: episode_key(e, season_key)[1]):
             _, ep_num = episode_key(ep, season_key)
+
+            # optional single episode restriction
+            if args.episode is not None and ep_num != args.episode:
+                continue
+
             ep_title = str(ep.get("title") or "").strip()
             extension = normalize_extension(ep.get("container_extension"))
 
@@ -1287,6 +1292,7 @@ def main() -> int:
     parser.add_argument("--db", default=DEFAULT_DB, help=f"path to kptv.db (default: {DEFAULT_DB})")
     parser.add_argument("--source", help="restrict to a single source by name or id")
     parser.add_argument("--season", type=int, help="download only this season number")
+    parser.add_argument("--episode", type=int, help="download only this episode number, requires --season")
     parser.add_argument("--exact", action="store_true", help="require an exact name match")
     parser.add_argument("--overwrite", action="store_true", help="re-download existing files")
     parser.add_argument("--no-cache", action="store_true", help="ignore the proxy's cached series info")
@@ -1296,6 +1302,11 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="verbose logging")
 
     args = parser.parse_args()
+    
+    # an episode number is meaningless without knowing which season it belongs to
+    if args.episode is not None and args.season is None:
+        parser.error("--episode requires --season")
+
     setup_logging(args.debug)
 
     try:

@@ -6,6 +6,20 @@ API_KEY="2fdeadd813c04c6eae1497d0f75dfa0e"
 # Usage: ./emby-clear.sh [logos|numbers|refresh|all]
 ACTION="${1:-all}"
 
+if [[ "$ACTION" == "refresh" || "$ACTION" == "all" ]]; then
+  # Refresh Live TV tuners
+  echo "Refreshing Live TV tuners..."
+  curl -s -X POST "${EMBY_HOST}/emby/LiveTv/TunerHosts/Discover?api_key=${API_KEY}" > /dev/null
+  echo "Tuners refreshed."
+
+  # Trigger guide refresh task
+  echo "Triggering guide refresh..."
+  TASK_ID=$(curl -s "${EMBY_HOST}/emby/ScheduledTasks?api_key=${API_KEY}" \
+    | python3 -c "import sys,json; tasks=[t for t in json.load(sys.stdin) if 'guide' in t['Name'].lower()]; print(tasks[0]['Id']) if tasks else None")
+  curl -s -X POST "${EMBY_HOST}/emby/ScheduledTasks/Running/${TASK_ID}?api_key=${API_KEY}" > /dev/null
+  echo "Guide refresh triggered."
+fi
+
 if [[ "$ACTION" == "logos" || "$ACTION" == "all" ]]; then
   echo "Fetching item IDs for logo clearing..."
   ITEM_IDS=$(curl -s "${EMBY_HOST}/emby/Items?Recursive=true&api_key=${API_KEY}" \
@@ -40,20 +54,6 @@ print(json.dumps(d))
     echo "  Cleared number: ${ID}"
   done
   echo "Channel numbers cleared."
-fi
-
-if [[ "$ACTION" == "refresh" || "$ACTION" == "all" ]]; then
-  # Refresh Live TV tuners
-  echo "Refreshing Live TV tuners..."
-  curl -s -X POST "${EMBY_HOST}/emby/LiveTv/TunerHosts/Discover?api_key=${API_KEY}" > /dev/null
-  echo "Tuners refreshed."
-
-  # Trigger guide refresh task
-  echo "Triggering guide refresh..."
-  TASK_ID=$(curl -s "${EMBY_HOST}/emby/ScheduledTasks?api_key=${API_KEY}" \
-    | python3 -c "import sys,json; tasks=[t for t in json.load(sys.stdin) if 'guide' in t['Name'].lower()]; print(tasks[0]['Id']) if tasks else None")
-  curl -s -X POST "${EMBY_HOST}/emby/ScheduledTasks/Running/${TASK_ID}?api_key=${API_KEY}" > /dev/null
-  echo "Guide refresh triggered."
 fi
 
 echo "Done."
